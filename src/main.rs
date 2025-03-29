@@ -15,6 +15,7 @@ use std::{
 
 use cadence::{BufferedUdpMetricSink, QueuingMetricSink, StatsdClient};
 use cadence_macros::set_global_default;
+use dotenv::dotenv;
 use figment::{providers::Env, Figment};
 use grpc_geyser::GrpcGeyserImpl;
 use jsonrpsee::server::{middleware::ProxyGetRequestLayer, ServerBuilder};
@@ -26,6 +27,7 @@ use solana_sdk::signature::{read_keypair_file, Keypair};
 use tracing::{error, info};
 use transaction_store::TransactionStoreImpl;
 use txn_sender::TxnSenderImpl;
+use anyhow::anyhow;
 
 #[derive(Debug, Deserialize)]
 struct AtlasTxnSenderEnv {
@@ -54,6 +56,9 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load .env file
+    dotenv().ok();
+
     // Init metrics/logging
     let env: AtlasTxnSenderEnv = Figment::from(Env::raw()).extract().unwrap();
     let env_filter = env::var("RUST_LOG")
@@ -104,10 +109,12 @@ async fn main() -> anyhow::Result<()> {
 
     let transaction_store = Arc::new(TransactionStoreImpl::new());
     let solana_rpc = Arc::new(GrpcGeyserImpl::new(
-        env.grpc_url.clone().unwrap(),
-        env.x_token.clone(),
+        env.grpc_url.ok_or_else(|| anyhow!("GRPC_URL environment variable is required"))?,
+        env.x_token,
     ));
-    let rpc_client = Arc::new(RpcClient::new(env.rpc_url.unwrap()));
+    let rpc_client = Arc::new(RpcClient::new(
+        env.rpc_url.ok_or_else(|| anyhow!("RPC_URL environment variable is required"))?
+    ));
     let num_leaders = env.num_leaders.unwrap_or(2);
     let leader_offset = env.leader_offset.unwrap_or(0);
     let leader_tracker = Arc::new(LeaderTrackerImpl::new(

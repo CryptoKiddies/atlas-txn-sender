@@ -94,6 +94,7 @@ impl GrpcGeyserImpl {
                             Some(UpdateOneof::Block(block)) => {
                                 let block_time = block.block_time.unwrap().timestamp;
                                 for transaction in block.transactions {
+                                    // TODO: deprecated new fn
                                     let signature =
                                         Signature::new(&transaction.signature).to_string();
                                     signature_cache.insert(signature, (block_time, Instant::now()));
