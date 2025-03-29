@@ -2,6 +2,7 @@
   stat:
     path: /home/ubuntu/atlas-txn-sender
   register: repo_exists
+# don't worry about clone, repo is already exists locally/Dockerfile
 - name: clone repo
   become: true
   become_user: ubuntu
@@ -25,11 +26,11 @@
   become: true
   become_user: root
   template:
-      src: templates/atlas-txn-sender.service.j2
-      dest: /etc/systemd/system/atlas-txn-sender.service
-      owner: root
-      group: root
-      mode: '0755'
+    src: templates/atlas-txn-sender.service.j2
+    dest: /etc/systemd/system/atlas-txn-sender.service
+    owner: root
+    group: root
+    mode: '0755'
 
 - name: Reload Systemd daemon
   become: true
