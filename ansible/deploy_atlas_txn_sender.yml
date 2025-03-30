@@ -1,13 +1,15 @@
 - name: atlas-txn-sender setup
   become: yes
   hosts: all
+  vars_files:
+    - secrets.yml
   vars:
     user: ubuntu
     service: atlas-txn-sender
-    rpc_url: https://devnet.helius-rpc.com/?api-key=c8405459-a909-4d08-a58e-ba28165268ab
+    rpc_url: '{{ vault_rpc_url }}'
     grpc_url: https://grpc-takehome-devnet.helius-rpc.com:443
-    x_token: 826dfa33-2a09-4edd-8a49-7a77c0e6fb3b
-    datadog_api_key: 6eec17f701aa475ade25ee728d3cd25d
+    x_token: '{{ vault_x_token }}'
+    datadog_api_key: '{{ vault_datadog_api_key }}'
     datadog_site: us5.datadoghq.com
     datadog_config:
       dogstatsd_port: 7998
