@@ -160,6 +160,7 @@ impl GrpcGeyserImpl {
                     (grpc_tx, grpc_rx) = subscription.unwrap();
                 }
                 grpc_tx.send(get_slot_subscribe_request()).await.unwrap();
+
                 while let Some(message) = grpc_rx.next().await {
                     match message {
                         Ok(msg) => {

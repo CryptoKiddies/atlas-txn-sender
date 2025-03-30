@@ -1,5 +1,6 @@
 mod errors;
 mod grpc_geyser;
+mod invalid_blockhash_cache;
 mod leader_tracker;
 mod rpc_server;
 mod solana_rpc;
@@ -13,11 +14,13 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::anyhow;
 use cadence::{BufferedUdpMetricSink, QueuingMetricSink, StatsdClient};
 use cadence_macros::set_global_default;
 use dotenv::dotenv;
 use figment::{providers::Env, Figment};
 use grpc_geyser::GrpcGeyserImpl;
+use invalid_blockhash_cache::InvalidBlockhashCache;
 use jsonrpsee::server::{middleware::ProxyGetRequestLayer, ServerBuilder};
 use leader_tracker::LeaderTrackerImpl;
 use rpc_server::{AtlasTxnSenderImpl, AtlasTxnSenderServer};
@@ -27,7 +30,6 @@ use solana_sdk::signature::{read_keypair_file, Keypair};
 use tracing::{error, info};
 use transaction_store::TransactionStoreImpl;
 use txn_sender::TxnSenderImpl;
-use anyhow::anyhow;
 
 #[derive(Debug, Deserialize)]
 struct AtlasTxnSenderEnv {
@@ -108,17 +110,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let transaction_store = Arc::new(TransactionStoreImpl::new());
+    let invalid_blockhash_cache = Arc::new(InvalidBlockhashCache::new());
     let solana_rpc = Arc::new(GrpcGeyserImpl::new(
-        env.grpc_url.ok_or_else(|| anyhow!("GRPC_URL environment variable is required"))?,
+        env.grpc_url
+            .ok_or_else(|| anyhow!("GRPC_URL environment variable is required"))?,
         env.x_token,
     ));
-    let rpc_client = Arc::new(RpcClient::new(
-        env.rpc_url.ok_or_else(|| anyhow!("RPC_URL environment variable is required"))?
-    ));
+    let rpc_client =
+        Arc::new(RpcClient::new(env.rpc_url.ok_or_else(|| {
+            anyhow!("RPC_URL environment variable is required")
+        })?));
     let num_leaders = env.num_leaders.unwrap_or(2);
     let leader_offset = env.leader_offset.unwrap_or(0);
     let leader_tracker = Arc::new(LeaderTrackerImpl::new(
-        rpc_client,
+        rpc_client.clone(),
         solana_rpc.clone(),
         num_leaders,
         leader_offset,
@@ -129,13 +134,19 @@ async fn main() -> anyhow::Result<()> {
         transaction_store.clone(),
         connection_cache,
         solana_rpc,
+        rpc_client.clone(),
+        invalid_blockhash_cache.clone(),
         env.txn_sender_threads.unwrap_or(4),
         txn_send_retry_interval_seconds,
         env.max_retry_queue_size,
     ));
     let max_txn_send_retries = env.max_txn_send_retries.unwrap_or(5);
-    let atlas_txn_sender =
-        AtlasTxnSenderImpl::new(txn_sender, transaction_store, max_txn_send_retries);
+    let atlas_txn_sender = AtlasTxnSenderImpl::new(
+        txn_sender,
+        transaction_store,
+        max_txn_send_retries,
+        invalid_blockhash_cache.clone(),
+    );
     let handle = server.start(atlas_txn_sender.into_rpc());
     handle.stopped().await;
     Ok(())

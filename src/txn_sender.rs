@@ -1,12 +1,18 @@
 use cadence_macros::{statsd_count, statsd_gauge, statsd_time};
 use solana_client::{
-    connection_cache::ConnectionCache, nonblocking::tpu_connection::TpuConnection,
+    connection_cache::ConnectionCache, 
+    rpc_client::RpcClient,
+    nonblocking::tpu_connection::TpuConnection
 };
 use solana_program_runtime::compute_budget::{ComputeBudget, MAX_COMPUTE_UNIT_LIMIT};
-use solana_sdk::transaction::VersionedTransaction;
+use solana_sdk::{
+    signature::Signature, 
+    transaction::{VersionedTransaction, TransactionError},
+};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
+    str::FromStr,
 };
 use tokio::{
     runtime::{Builder, Runtime},
@@ -16,9 +22,7 @@ use tonic::async_trait;
 use tracing::{error, warn};
 
 use crate::{
-    leader_tracker::LeaderTracker,
-    solana_rpc::SolanaRpc,
-    transaction_store::{get_signature, TransactionData, TransactionStore},
+    leader_tracker::LeaderTracker, invalid_blockhash_cache::InvalidBlockhashCache, solana_rpc::SolanaRpc, transaction_store::{get_signature, TransactionData, TransactionStore}
 };
 use solana_program_runtime::compute_budget::DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT;
 use solana_sdk::borsh0_10::try_from_slice_unchecked;
@@ -41,6 +45,8 @@ pub struct TxnSenderImpl {
     transaction_store: Arc<dyn TransactionStore>,
     connection_cache: Arc<ConnectionCache>,
     solana_rpc: Arc<dyn SolanaRpc>,
+    rpc_client: Arc<RpcClient>,
+    invalid_blockhash_cache: Arc<InvalidBlockhashCache>,
     txn_sender_runtime: Arc<Runtime>,
     txn_send_retry_interval_seconds: usize,
     max_retry_queue_size: Option<usize>,
@@ -52,6 +58,8 @@ impl TxnSenderImpl {
         transaction_store: Arc<dyn TransactionStore>,
         connection_cache: Arc<ConnectionCache>,
         solana_rpc: Arc<dyn SolanaRpc>,
+        rpc_client: Arc<RpcClient>,
+        invalid_blockhash_cache: Arc<InvalidBlockhashCache>,
         txn_sender_threads: usize,
         txn_send_retry_interval_seconds: usize,
         max_retry_queue_size: Option<usize>,
@@ -66,6 +74,8 @@ impl TxnSenderImpl {
             transaction_store,
             connection_cache,
             solana_rpc,
+            rpc_client,
+            invalid_blockhash_cache,
             txn_sender_runtime: Arc::new(txn_sender_runtime),
             txn_send_retry_interval_seconds,
             max_retry_queue_size,
@@ -182,8 +192,7 @@ impl TxnSenderImpl {
             return;
         }
         let signature = signature.unwrap();
-        self.transaction_store
-            .add_transaction(transaction_data.clone());
+        self.transaction_store.add_transaction(transaction_data.clone());
         let PriorityDetails {
             fee,
             cu_limit,
@@ -191,18 +200,39 @@ impl TxnSenderImpl {
         } = compute_priority_details(&transaction_data.versioned_transaction);
         let priority_fees_enabled = (fee > 0).to_string();
         let solana_rpc = self.solana_rpc.clone();
+        let rpc_client = self.rpc_client.clone(); 
+        let mut invalid_blockhash_cache = self.invalid_blockhash_cache.clone();
         let transaction_store = self.transaction_store.clone();
         let api_key = transaction_data
             .request_metadata
             .clone()
             .map(|m| m.api_key.clone())
             .unwrap_or("none".to_string());
+        let blockhash = transaction_data.versioned_transaction.message.recent_blockhash().to_string();
+        
         self.txn_sender_runtime.spawn(async move {
+            // Check transaction status for blockhash errors
+            match rpc_client.get_signature_statuses(&[Signature::from_str(&signature).unwrap()]) {
+                Ok(statuses) => {
+                    if let Some(err) = statuses.value.first().and_then(|s| s.as_ref()).and_then(|s| s.err.as_ref()) {
+                        if matches!(err, TransactionError::BlockhashNotFound) {
+                            Arc::make_mut(&mut invalid_blockhash_cache).set_invalid(&blockhash);
+                        }
+                    }
+                }
+                Err(err) => {
+                    if err.to_string().to_lowercase().contains("blockhash not found") {
+                        Arc::make_mut(&mut invalid_blockhash_cache).set_invalid(&blockhash);
+                    }
+                }
+            }
+            
             let confirmed_at = solana_rpc.confirm_transaction(signature.clone()).await;
-            let transcation_data = transaction_store.remove_transaction(signature);
+            // TODO: redesign to prevent txn redundance - this allows resends of same txn
+            let transaction_data = transaction_store.remove_transaction(signature);
             let mut retries = None;
             let mut max_retries = None;
-            if let Some(transaction_data) = transcation_data {
+            if let Some(transaction_data) = transaction_data {
                 retries = Some(transaction_data.retry_count as i32);
                 max_retries = Some(transaction_data.max_retries as i32);
             }
@@ -287,6 +317,7 @@ impl TxnSender for TxnSenderImpl {
             .unwrap_or("none".to_string());
         let mut leader_num = 0;
         for leader in self.leader_tracker.get_leaders() {
+            // TODO: Check a tpu legacy flag for allowed fallback to tpu regular
             if leader.tpu_quic.is_none() {
                 error!("leader {:?} has no tpu_quic", leader);
                 continue;
@@ -299,17 +330,17 @@ impl TxnSender for TxnSenderImpl {
                     let conn =
                         connection_cache.get_nonblocking_connection(&leader.tpu_quic.unwrap());
                     if let Ok(result) = timeout(MAX_TIMEOUT_SEND_DATA, conn.send_data(&wire_transaction)).await {
-                            if let Err(e) = result {
-                                if i == SEND_TXN_RETRIES-1 {
-                                    error!(
-                                        retry = "false",
-                                        "Failed to send transaction to {:?}: {}",
-                                        leader, e
-                                    );
-                                    statsd_count!("transaction_send_error", 1, "retry" => "false", "last_attempt" => "true");
-                                } else {
-                                    statsd_count!("transaction_send_error", 1, "retry" => "false", "last_attempt" => "false");
-                                }
+                        if let Err(e) = result {
+                            if i == SEND_TXN_RETRIES-1 {
+                                error!(
+                                    retry = "false",
+                                    "Failed to send transaction to {:?}: {}",
+                                    leader, e
+                                );
+                                statsd_count!("transaction_send_error", 1, "retry" => "false", "last_attempt" => "true");
+                            } else {
+                                statsd_count!("transaction_send_error", 1, "retry" => "false", "last_attempt" => "false");
+                            }
                         } else {
                             let leader_num_str = leader_num.to_string();
                             statsd_time!(
@@ -330,15 +361,18 @@ impl TxnSender for TxnSenderImpl {
     async fn send_transaction_bundle(&self, transactions: Vec<TransactionData>) -> Vec<String> {
         let mut signatures = Vec::new();
         let solana_rpc = self.solana_rpc.clone();
-        let transaction_store = self.transaction_store.clone();
 
         for transaction_data in transactions {
             let signature = get_signature(&transaction_data).unwrap();
+
+            self.track_transaction(&transaction_data);
             
             // Send transaction to all leaders with retries
             let mut success = false;
             let mut leader_num = 0;
+
             for leader in self.leader_tracker.get_leaders() {
+                // TODO: Check a tpu legacy flag for allowed fallback to tpu regular
                 if leader.tpu_quic.is_none() {
                     error!("leader {:?} has no tpu_quic", leader);
                     continue;
@@ -376,24 +410,19 @@ impl TxnSender for TxnSenderImpl {
                         statsd_count!("transaction_send_timeout", 1);
                     }
                 }
+                
                 if success {
+                    if let Some(_) = solana_rpc.confirm_transaction(signature.clone()).await {
+                        signatures.push(signature.clone());
+                    } else {
+                        // If transaction failed to confirm, stop processing the bundle
+                        break;
+                    }
+                } else {
+                    // If we couldn't send to any leader, stop processing the bundle
                     break;
                 }
                 leader_num += 1;
-            }
-
-            if success {
-                // Track transaction and wait for confirmation
-                self.track_transaction(&transaction_data);
-                if let Some(_) = solana_rpc.confirm_transaction(signature.clone()).await {
-                    signatures.push(signature);
-                } else {
-                    // If transaction failed to confirm, stop processing the bundle
-                    break;
-                }
-            } else {
-                // If we couldn't send to any leader, stop processing the bundle
-                break;
             }
         }
 
