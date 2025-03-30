@@ -1,2 +1,4 @@
 .vscode/
 target/
+ansible/secrets.yml
+ansible/inventory/hosts.yml
