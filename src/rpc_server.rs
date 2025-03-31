@@ -153,7 +153,7 @@ impl AtlasTxnSenderServer for AtlasTxnSenderImpl {
             self.txn_sender.send_transaction(transaction);
             sig = signature;
         } else {
-            return Err(invalid_request("transaction is a duplicate"));
+            return Err(invalid_request("transaction is a duplicate or invalid"));
         }
 
         let api_key = request_metadata
@@ -185,7 +185,7 @@ impl AtlasTxnSenderServer for AtlasTxnSenderImpl {
                 self.validate_and_decode_transaction(txn, &params, &request_metadata, start)?;
             if transaction.is_none() {
                 return Err(invalid_request(
-                    "Bundle contains duplicate transactions. All transactions must be unique.",
+                    "Bundle contains duplicate or invalid transactions.",
                 ));
             }
             transaction_data_vec.push(transaction.unwrap());
@@ -195,7 +195,6 @@ impl AtlasTxnSenderServer for AtlasTxnSenderImpl {
             .txn_sender
             .send_transaction_bundle(transaction_data_vec)
             .await;
-
         let api_key = request_metadata
             .as_ref()
             .map(|m| m.api_key.as_str())
