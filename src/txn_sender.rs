@@ -20,6 +20,8 @@ use tokio::{
 };
 use tonic::async_trait;
 use tracing::{error, warn};
+use std::sync::Mutex;
+
 
 use crate::{
     leader_tracker::LeaderTracker, invalid_blockhash_cache::InvalidBlockhashCache, solana_rpc::SolanaRpc, transaction_store::{get_signature, TransactionData, TransactionStore}
@@ -216,12 +218,16 @@ impl TxnSenderImpl {
                 Ok(statuses) => {
                     if let Some(err) = statuses.value.first().and_then(|s| s.as_ref()).and_then(|s| s.err.as_ref()) {
                         if matches!(err, TransactionError::BlockhashNotFound) {
+                            // TODO: remove this once we're done testing
+                            warn!("Blockhash not found in track_transaction OK: {:?}", blockhash);
                             Arc::make_mut(&mut invalid_blockhash_cache).set_invalid(&blockhash);
                         }
                     }
                 }
                 Err(err) => {
                     if err.to_string().to_lowercase().contains("blockhash not found") {
+                        // TODO: remove this once we're done testing
+                        warn!("Blockhash not found in track_transaction Err: {:?}", blockhash);
                         Arc::make_mut(&mut invalid_blockhash_cache).set_invalid(&blockhash);
                     }
                 }
@@ -359,20 +365,15 @@ impl TxnSender for TxnSenderImpl {
     }
 
     async fn send_transaction_bundle(&self, transactions: Vec<TransactionData>) -> Vec<String> {
-        let mut signatures = Vec::new();
+        let signatures = Arc::new(Mutex::new(Vec::new()));
         let solana_rpc = self.solana_rpc.clone();
 
         for transaction_data in transactions {
             let signature = get_signature(&transaction_data).unwrap();
-
             self.track_transaction(&transaction_data);
             
-            // Send transaction to all leaders with retries
-            let mut success = false;
             let mut leader_num = 0;
-
             for leader in self.leader_tracker.get_leaders() {
-                // TODO: Check a tpu legacy flag for allowed fallback to tpu regular
                 if leader.tpu_quic.is_none() {
                     error!("leader {:?} has no tpu_quic", leader);
                     continue;
@@ -380,53 +381,62 @@ impl TxnSender for TxnSenderImpl {
                 let connection_cache = self.connection_cache.clone();
                 let wire_transaction = transaction_data.wire_transaction.clone();
                 let leader = Arc::new(leader.clone());
+                let signature = signature.clone();
+                let solana_rpc = solana_rpc.clone();
+                let signatures = signatures.clone();  // Clone before moving into spawn
                 
-                // Try to send with retries
-                for i in 0..SEND_TXN_RETRIES {
-                    let conn = connection_cache.get_nonblocking_connection(&leader.tpu_quic.unwrap());
-                    if let Ok(result) = timeout(MAX_TIMEOUT_SEND_DATA, conn.send_data(&wire_transaction)).await {
-                        if result.is_ok() {
-                            success = true;
-                            let leader_num_str = leader_num.to_string();
-                            statsd_time!(
-                                "transaction_received_by_leader",
-                                transaction_data.sent_at.elapsed(),
-                                "leader_num" => &leader_num_str,
-                                "api_key" => "not_applicable",
-                                "retry" => "false"
-                            );
-                            break;
-                        } else if i == SEND_TXN_RETRIES-1 {
-                            error!(
-                                retry = "false",
-                                "Failed to send transaction to {:?}: {:?}",
-                                leader, result
-                            );
-                            statsd_count!("transaction_send_error", 1, "retry" => "false", "last_attempt" => "true");
+                self.txn_sender_runtime.spawn(async move {
+                    // Try to send with retries
+                    for i in 0..SEND_TXN_RETRIES {
+                        let conn = connection_cache.get_nonblocking_connection(&leader.tpu_quic.unwrap());
+                        if let Ok(result) = timeout(MAX_TIMEOUT_SEND_DATA, conn.send_data(&wire_transaction)).await {
+                            if result.is_ok() {
+                                let leader_num_str = leader_num.to_string();
+                                statsd_time!(
+                                    "transaction_received_by_leader",
+                                    transaction_data.sent_at.elapsed(),
+                                    "leader_num" => &leader_num_str,
+                                    "api_key" => "not_applicable",
+                                    "retry" => "false"
+                                );
+                                break;
+                            } else if i == SEND_TXN_RETRIES-1 {
+                                error!(
+                                    retry = "false",
+                                    "Failed to send transaction to {:?}: {:?}",
+                                    leader, result
+                                );
+                                statsd_count!("transaction_send_error", 1, "retry" => "false", "last_attempt" => "true");
+                            }
                         } else {
-                            statsd_count!("transaction_send_error", 1, "retry" => "false", "last_attempt" => "false");
+                            statsd_count!("transaction_send_timeout", 1);
                         }
-                    } else {
-                        statsd_count!("transaction_send_timeout", 1);
                     }
-                }
-                
-                if success {
+                    
+                    // Only the first successful confirmation will add the signature
                     if let Some(_) = solana_rpc.confirm_transaction(signature.clone()).await {
-                        signatures.push(signature.clone());
-                    } else {
-                        // If transaction failed to confirm, stop processing the bundle
-                        break;
+                        let mut sigs = signatures.lock().unwrap();
+                        if !sigs.contains(&signature) {
+                            sigs.push(signature);
+                        }
                     }
-                } else {
-                    // If we couldn't send to any leader, stop processing the bundle
-                    break;
-                }
+                });
                 leader_num += 1;
+            }
+
+            // Wait for this transaction to confirm before proceeding
+            if let Some(_) = solana_rpc.confirm_transaction(signature.clone()).await {
+                // Continue to next transaction
+            } else {
+                // If transaction failed to confirm, stop processing the bundle
+                warn!("transaction failed to confirm: {:?}", signature);
+                break;
             }
         }
 
-        signatures
+        // Return the collected signatures
+        let final_signatures = signatures.lock().unwrap().clone();
+        final_signatures
     }
 }
 

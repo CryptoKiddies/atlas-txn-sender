@@ -59,3 +59,17 @@ The assessment should take between 1-8 hours to complete, depending on your fami
   - https://www.helius.dev/blog
 - Use the Helius Discord to ask Solana-related questions.
 - Be creative and have fun with it!
+
+airdrop req:
+curl https://api.devnet.solana.com -s -X \
+ POST -H "Content-Type: application/json" -d '
+{
+"jsonrpc": "2.0",
+"id": 1,
+"method": "requestAirdrop",
+"params": [
+"83astBRguLMdt2h5U1Tpdq5tjFoJ6noeGwaY3mDLVcri",
+1000000000
+]
+}
+'
