@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  atlas-txn-sender:
+    build: .
+    ports:
+      - '7998:7998' # Datadog statsd port
+    environment:
+      - RPC_URL=${RPC_URL}
+      - GRPC_URL=${GRPC_URL}
+      - X_TOKEN=${X_TOKEN}
+    volumes:
+      - .:/app
+    restart: unless-stopped
+    env_file:
+      - .env
