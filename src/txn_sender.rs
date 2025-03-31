@@ -364,8 +364,9 @@ impl TxnSender for TxnSenderImpl {
         }
     }
 
+    // TODO: refactor shared logic with send_transaction 
     async fn send_transaction_bundle(&self, transactions: Vec<TransactionData>) -> Vec<String> {
-        let signatures = Arc::new(Mutex::new(Vec::new()));
+        let mut signatures: Vec<String> = Vec::new();
         let solana_rpc = self.solana_rpc.clone();
 
         for transaction_data in transactions {
@@ -380,10 +381,7 @@ impl TxnSender for TxnSenderImpl {
                 }
                 let connection_cache = self.connection_cache.clone();
                 let wire_transaction = transaction_data.wire_transaction.clone();
-                let leader = Arc::new(leader.clone());
-                let signature = signature.clone();
-                let solana_rpc = solana_rpc.clone();
-                let signatures = signatures.clone();  // Clone before moving into spawn
+                let leader = Arc::new(leader.clone());  // Clone before moving into spawn
                 
                 self.txn_sender_runtime.spawn(async move {
                     // Try to send with retries
@@ -412,21 +410,13 @@ impl TxnSender for TxnSenderImpl {
                             statsd_count!("transaction_send_timeout", 1);
                         }
                     }
-                    
-                    // Only the first successful confirmation will add the signature
-                    if let Some(_) = solana_rpc.confirm_transaction(signature.clone()).await {
-                        let mut sigs = signatures.lock().unwrap();
-                        if !sigs.contains(&signature) {
-                            sigs.push(signature);
-                        }
-                    }
                 });
                 leader_num += 1;
             }
 
             // Wait for this transaction to confirm before proceeding
             if let Some(_) = solana_rpc.confirm_transaction(signature.clone()).await {
-                // Continue to next transaction
+                signatures.push(signature);
             } else {
                 // If transaction failed to confirm, stop processing the bundle
                 warn!("transaction failed to confirm: {:?}", signature);
@@ -434,9 +424,7 @@ impl TxnSender for TxnSenderImpl {
             }
         }
 
-        // Return the collected signatures
-        let final_signatures = signatures.lock().unwrap().clone();
-        final_signatures
+        signatures
     }
 }
 
