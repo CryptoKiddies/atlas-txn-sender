@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 
 use crate::{
-    leader_tracker::LeaderTracker, invalid_blockhash_cache::InvalidBlockhashCache, solana_rpc::SolanaRpc, transaction_store::{get_signature, TransactionData, TransactionStore}
+    invalid_blockhash_cache::InvalidBlockhashCache, leader_tracker::LeaderTracker, solana_rpc::{SolanaRpc, TxnCommitment}, transaction_store::{get_signature, TransactionData, TransactionStore}
 };
 use solana_program_runtime::compute_budget::DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT;
 use solana_sdk::borsh0_10::try_from_slice_unchecked;
@@ -194,6 +194,7 @@ impl TxnSenderImpl {
             return;
         }
         let signature = signature.unwrap();
+        // TODO: redesign to prevent txn redundance - this allows resends of same txn
         self.transaction_store.add_transaction(transaction_data.clone());
         let PriorityDetails {
             fee,
@@ -215,10 +216,11 @@ impl TxnSenderImpl {
         self.txn_sender_runtime.spawn(async move {
             let start_time = Instant::now();
             // Will wait up to 60 seconds (from GrpcGeyserImpl implementation)
-            let confirmed_at = solana_rpc.confirm_transaction(signature.clone()).await;
+            let processed_at = solana_rpc.verify_transaction(signature.clone(), TxnCommitment::Processed).await;
+            let mut is_skip_confirm = false;
             warn!("Confirmation check took {:?}", start_time.elapsed());
             
-            if confirmed_at.is_none() {
+            if processed_at.is_none() {
                 // TODO: remove logs and else blocks
                 // Only check for blockhash errors if confirmation failed
                 warn!("Transaction failed to confirm after {:?}, checking status", start_time.elapsed());
@@ -232,6 +234,7 @@ impl TxnSenderImpl {
                             } else {
                                 warn!("Transaction failed with error: {:?}", err);
                             }
+                            is_skip_confirm = true;
                         }
                     }
                     Err(err) => {
@@ -239,14 +242,20 @@ impl TxnSenderImpl {
                         // TODO: remove this once we're done testing
                             warn!("Blockhash not found in track_transaction Err: {:?}", blockhash);
                             Arc::make_mut(&mut invalid_blockhash_cache).set_invalid(&blockhash);
+                            is_skip_confirm = true;
                         } else {
                             warn!("Error checking transaction status: {:?}", err);
                         }
                     }
                 }
-            }
+            } 
 
-            // TODO: redesign to prevent txn redundance - this allows resends of same txn
+            let confirmed_at = if is_skip_confirm {
+                None
+            } else {
+                solana_rpc.verify_transaction(signature.clone(), TxnCommitment::Confirmed).await
+            };
+
             // Remove from transaction store and collect metrics
             let transaction_data = transaction_store.remove_transaction(signature);
             let mut retries = None;
@@ -448,7 +457,7 @@ impl TxnSender for TxnSenderImpl {
             }
 
             tokio::select!{
-                confirmation = solana_rpc.confirm_transaction(signature.clone()) => {
+                confirmation = solana_rpc.verify_transaction(signature.clone(), TxnCommitment::Confirmed) => {
                     if let Some(_) = confirmation {
                         signatures.push(signature);
                     } else {
