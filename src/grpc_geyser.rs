@@ -16,17 +16,18 @@ use tracing::error;
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::geyser::SubscribeRequestFilterBlocks;
 use yellowstone_grpc_proto::geyser::{
-    subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest, SubscribeRequestFilterSlots,
+    subscribe_update::UpdateOneof, SubscribeRequest, SubscribeRequestFilterSlots,
     SubscribeRequestPing,
 };
 
-use crate::solana_rpc::SolanaRpc;
+use crate::solana_rpc::{SolanaRpc, TxnCommitment};
 
 pub struct GrpcGeyserImpl {
     endpoint: String,
     auth_header: Option<String>,
     cur_slot: Arc<AtomicU64>,
-    signature_cache: Arc<DashMap<String, (UnixTimestamp, Instant)>>,
+    processed_signature_cache: Arc<DashMap<String, (UnixTimestamp, Instant)>>,
+    confirmed_signature_cache: Arc<DashMap<String, (UnixTimestamp, Instant)>>,
 }
 
 impl GrpcGeyserImpl {
@@ -35,31 +36,41 @@ impl GrpcGeyserImpl {
             endpoint,
             auth_header,
             cur_slot: Arc::new(AtomicU64::new(0)),
-            signature_cache: Arc::new(DashMap::new()),
+            processed_signature_cache: Arc::new(DashMap::new()),
+            confirmed_signature_cache: Arc::new(DashMap::new()),
         };
         // polling with processed commitment to get latest leaders
         grpc_geyser.poll_slots();
-        // polling with confirmed commitment to get confirmed transactions
-        grpc_geyser.poll_blocks();
+        grpc_geyser.poll_blocks(TxnCommitment::Processed);
+        grpc_geyser.poll_blocks(TxnCommitment::Confirmed);
         grpc_geyser.clean_signature_cache();
         grpc_geyser
     }
 
     fn clean_signature_cache(&self) {
-        let signature_cache = self.signature_cache.clone();
+        let processed_signature_cache = self.processed_signature_cache.clone();
+        let confirmed_signature_cache = self.confirmed_signature_cache.clone();
+
         tokio::spawn(async move {
             loop {
-                let signature_cache = signature_cache.clone();
-                signature_cache.retain(|_, (_, v)| v.elapsed().as_secs() < 90);
+                let processed_signature_cache = processed_signature_cache.clone();
+                let confirmed_signature_cache = confirmed_signature_cache.clone();
+
+                processed_signature_cache.retain(|_, (_, v)| v.elapsed().as_secs() < 90);
+                confirmed_signature_cache.retain(|_, (_, v)| v.elapsed().as_secs() < 90);
+
                 sleep(Duration::from_secs(60)).await;
             }
         });
     }
 
-    fn poll_blocks(&self) {
+    fn poll_blocks(&self, commitment: TxnCommitment) {
         let endpoint = self.endpoint.clone();
         let auth_header = self.auth_header.clone();
-        let signature_cache = self.signature_cache.clone();
+        let signature_cache = match commitment {
+            TxnCommitment::Processed => self.processed_signature_cache.clone(),
+            TxnCommitment::Confirmed => self.confirmed_signature_cache.clone(),
+        };
         tokio::spawn(async move {
             loop {
                 let mut grpc_tx;
@@ -78,7 +89,7 @@ impl GrpcGeyserImpl {
                     }
                     let subscription = grpc_client
                         .unwrap()
-                        .subscribe_with_request(Some(get_block_subscribe_request()))
+                        .subscribe_with_request(Some(get_block_subscribe_request(commitment)))
                         .await;
                     if let Err(e) = subscription {
                         error!("Error subscribing to gRPC stream, waiting one second then retrying connect: {}", e);
@@ -94,8 +105,9 @@ impl GrpcGeyserImpl {
                             Some(UpdateOneof::Block(block)) => {
                                 let block_time = block.block_time.unwrap().timestamp;
                                 for transaction in block.transactions {
-                                    let signature =
-                                        Signature::new(&transaction.signature).to_string();
+                                    let sig_arr: [u8; 64] =
+                                        transaction.signature.try_into().unwrap();
+                                    let signature = Signature::from(sig_arr).to_string();
                                     signature_cache.insert(signature, (block_time, Instant::now()));
                                 }
                             }
@@ -159,6 +171,7 @@ impl GrpcGeyserImpl {
                     (grpc_tx, grpc_rx) = subscription.unwrap();
                 }
                 grpc_tx.send(get_slot_subscribe_request()).await.unwrap();
+
                 while let Some(message) = grpc_rx.next().await {
                     match message {
                         Ok(msg) => {
@@ -197,11 +210,25 @@ impl GrpcGeyserImpl {
 
 #[async_trait]
 impl SolanaRpc for GrpcGeyserImpl {
-    async fn confirm_transaction(&self, signature: String) -> Option<UnixTimestamp> {
+    async fn verify_transaction(
+        &self,
+        signature: String,
+        commitment: TxnCommitment,
+    ) -> Option<UnixTimestamp> {
         let start = Instant::now();
         // in practice if a tx doesn't land in less than 60 seconds it's probably not going to land
-        while start.elapsed() < Duration::from_secs(60) {
-            if let Some(block_time) = self.signature_cache.get(&signature) {
+        // TODO: test working assumptions on durations below and parameterize to configs
+        let timeout_duration = match commitment {
+            TxnCommitment::Processed => Duration::from_secs(10),
+            TxnCommitment::Confirmed => Duration::from_secs(30),
+        };
+        let signature_cache = match commitment {
+            TxnCommitment::Processed => self.processed_signature_cache.clone(),
+            TxnCommitment::Confirmed => self.confirmed_signature_cache.clone(),
+        };
+
+        while start.elapsed() < timeout_duration {
+            if let Some(block_time) = signature_cache.get(&signature) {
                 return Some(block_time.0.clone());
             }
             sleep(Duration::from_millis(10)).await;
@@ -225,7 +252,7 @@ fn generate_random_string(len: usize) -> String {
         .collect()
 }
 
-fn get_block_subscribe_request() -> SubscribeRequest {
+fn get_block_subscribe_request(commitment: TxnCommitment) -> SubscribeRequest {
     SubscribeRequest {
         blocks: HashMap::from_iter(vec![(
             generate_random_string(20),
@@ -236,7 +263,7 @@ fn get_block_subscribe_request() -> SubscribeRequest {
                 include_entries: Some(false),
             },
         )]),
-        commitment: Some(CommitmentLevel::Confirmed.into()),
+        commitment: Some(commitment.into()),
         ..Default::default()
     }
 }

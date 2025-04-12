@@ -1,2 +1,8 @@
 .vscode/
 target/
+ansible/secrets.yml
+ansible/inventory/hosts.yml
+**/.env*
+**/.DS_Store
+
+instructions.md

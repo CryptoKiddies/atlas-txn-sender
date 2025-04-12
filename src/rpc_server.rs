@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Instant};
 
 use cadence_macros::{statsd_count, statsd_time};
+
 use jsonrpsee::{
     core::{async_trait, RpcResult},
     proc_macros::rpc,
@@ -10,9 +11,11 @@ use serde::Deserialize;
 use solana_rpc_client_api::config::RpcSendTransactionConfig;
 use solana_sdk::transaction::VersionedTransaction;
 use solana_transaction_status::UiTransactionEncoding;
+use tokio::sync::RwLock;
 
 use crate::{
     errors::invalid_request,
+    invalid_blockhash_cache::InvalidBlockhashCache,
     transaction_store::{TransactionData, TransactionStore},
     txn_sender::TxnSender,
     vendor::solana_rpc::decode_and_deserialize,
@@ -37,12 +40,20 @@ pub trait AtlasTxnSender {
         params: RpcSendTransactionConfig,
         request_metadata: Option<RequestMetadata>,
     ) -> RpcResult<String>;
+    #[method(name = "sendTransactionBundle")]
+    async fn send_transaction_bundle(
+        &self,
+        transactions: Vec<String>,
+        params: RpcSendTransactionConfig,
+        request_metadata: Option<RequestMetadata>,
+    ) -> RpcResult<Vec<String>>;
 }
 
 pub struct AtlasTxnSenderImpl {
     txn_sender: Arc<dyn TxnSender>,
     transaction_store: Arc<dyn TransactionStore>,
     max_txn_send_retries: usize,
+    invalid_blockhash_cache: Arc<RwLock<InvalidBlockhashCache>>,
 }
 
 impl AtlasTxnSenderImpl {
@@ -50,12 +61,78 @@ impl AtlasTxnSenderImpl {
         txn_sender: Arc<dyn TxnSender>,
         transaction_store: Arc<dyn TransactionStore>,
         max_txn_send_retries: usize,
+        invalid_blockhash_cache: Arc<RwLock<InvalidBlockhashCache>>,
     ) -> Self {
         Self {
             txn_sender,
             max_txn_send_retries,
             transaction_store,
+            invalid_blockhash_cache,
         }
+    }
+
+    async fn validate_and_decode_transaction(
+        &self,
+        txn: String,
+        params: &RpcSendTransactionConfig,
+        request_metadata: &Option<RequestMetadata>,
+        sent_at: Instant,
+    ) -> RpcResult<(Option<TransactionData>, String)> {
+        let api_key = request_metadata
+            .as_ref()
+            .map(|m| m.api_key.as_str())
+            .unwrap_or("none");
+        statsd_count!("send_transaction", 1, "api_key" => api_key);
+
+        validate_send_transaction_params(params)?;
+
+        let encoding = params.encoding.unwrap_or(UiTransactionEncoding::Base58);
+        let binary_encoding = encoding.into_binary_encoding().ok_or_else(|| {
+            invalid_request(&format!(
+                "unsupported encoding: {encoding}. Supported encodings: base58, base64"
+            ))
+        })?;
+
+        let (wire_transaction, versioned_transaction) =
+            match decode_and_deserialize::<VersionedTransaction>(txn, binary_encoding) {
+                Ok((wire_transaction, versioned_transaction)) => {
+                    (wire_transaction, versioned_transaction)
+                }
+                Err(e) => {
+                    return Err(invalid_request(&e.to_string()));
+                }
+            };
+
+        let blockhash = versioned_transaction.message.recent_blockhash();
+        if self
+            .invalid_blockhash_cache
+            .read()
+            .await
+            .is_invalid(&blockhash.to_string())
+        {
+            return Err(invalid_request("Blockhash is invalid"));
+        }
+
+        let signature = versioned_transaction.signatures[0].to_string();
+        if self.transaction_store.has_signature(&signature) {
+            statsd_count!("duplicate_transaction", 1, "api_key" => api_key);
+            return Ok((None, signature));
+        }
+
+        Ok((
+            Some(TransactionData {
+                wire_transaction,
+                versioned_transaction,
+                sent_at,
+                retry_count: 0,
+                max_retries: std::cmp::min(
+                    self.max_txn_send_retries,
+                    params.max_retries.unwrap_or(self.max_txn_send_retries),
+                ),
+                request_metadata: request_metadata.clone(),
+            }),
+            signature,
+        ))
     }
 }
 
@@ -70,52 +147,70 @@ impl AtlasTxnSenderServer for AtlasTxnSenderImpl {
         params: RpcSendTransactionConfig,
         request_metadata: Option<RequestMetadata>,
     ) -> RpcResult<String> {
-        let sent_at = Instant::now();
-        let api_key = request_metadata
-            .clone()
-            .map(|m| m.api_key)
-            .unwrap_or("none".to_string());
-        statsd_count!("send_transaction", 1, "api_key" => &api_key);
-        validate_send_transaction_params(&params)?;
         let start = Instant::now();
-        let encoding = params.encoding.unwrap_or(UiTransactionEncoding::Base58);
-        let binary_encoding = encoding.into_binary_encoding().ok_or_else(|| {
-            invalid_request(&format!(
-                "unsupported encoding: {encoding}. Supported encodings: base58, base64"
-            ))
-        })?;
-        let (wire_transaction, versioned_transaction) =
-            match decode_and_deserialize::<VersionedTransaction>(txn, binary_encoding) {
-                Ok((wire_transaction, versioned_transaction)) => {
-                    (wire_transaction, versioned_transaction)
-                }
-                Err(e) => {
-                    return Err(invalid_request(&e.to_string()));
-                }
-            };
-        let signature = versioned_transaction.signatures[0].to_string();
-        if self.transaction_store.has_signature(&signature) {
-            statsd_count!("duplicate_transaction", 1, "api_key" => &api_key);
-            return Ok(signature);
+        let sig;
+
+        if let (Some(transaction), signature) = self
+            .validate_and_decode_transaction(txn, &params, &request_metadata, start)
+            .await?
+        {
+            self.txn_sender.send_transaction(transaction);
+            sig = signature;
+        } else {
+            return Err(invalid_request("transaction is a duplicate or invalid"));
         }
-        let transaction = TransactionData {
-            wire_transaction,
-            versioned_transaction,
-            sent_at,
-            retry_count: 0,
-            max_retries: std::cmp::min(
-                self.max_txn_send_retries,
-                params.max_retries.unwrap_or(self.max_txn_send_retries),
-            ),
-            request_metadata,
-        };
-        self.txn_sender.send_transaction(transaction);
+
+        let api_key = request_metadata
+            .as_ref()
+            .map(|m| m.api_key.as_str())
+            .unwrap_or("none");
         statsd_time!(
             "send_transaction_time",
             start.elapsed(),
-            "api_key" => &api_key
+            "api_key" => api_key
         );
-        Ok(signature)
+
+        // TODO: add a status msg for redundant txn
+        Ok(sig)
+    }
+
+    async fn send_transaction_bundle(
+        &self,
+        transactions: Vec<String>,
+        params: RpcSendTransactionConfig,
+        request_metadata: Option<RequestMetadata>,
+    ) -> RpcResult<Vec<String>> {
+        let start = Instant::now();
+        let mut transaction_data_vec = Vec::new();
+        let mut signatures = Vec::new();
+
+        // TODO: parallelize validations?
+        for txn in transactions {
+            let (transaction, signature) = self
+                .validate_and_decode_transaction(txn, &params, &request_metadata, start)
+                .await?;
+            if transaction.is_none() {
+                return Err(invalid_request(
+                    "Bundle contains duplicate or invalid transactions.",
+                ));
+            }
+            transaction_data_vec.push(transaction.unwrap());
+            signatures.push(signature);
+        }
+
+        self.txn_sender
+            .send_transaction_bundle(transaction_data_vec);
+        let api_key = request_metadata
+            .as_ref()
+            .map(|m| m.api_key.as_str())
+            .unwrap_or("none");
+        statsd_time!(
+            "send_transaction_time",
+            start.elapsed(),
+            "api_key" => api_key
+        );
+
+        Ok(signatures)
     }
 }
 
