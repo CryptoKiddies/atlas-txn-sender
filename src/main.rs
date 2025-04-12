@@ -27,6 +27,7 @@ use rpc_server::{AtlasTxnSenderImpl, AtlasTxnSenderServer};
 use serde::Deserialize;
 use solana_client::{connection_cache::ConnectionCache, rpc_client::RpcClient};
 use solana_sdk::signature::{read_keypair_file, Keypair};
+use tokio::sync::RwLock;
 use tracing::{error, info};
 use transaction_store::TransactionStoreImpl;
 use txn_sender::TxnSenderImpl;
@@ -110,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let transaction_store = Arc::new(TransactionStoreImpl::new());
-    let invalid_blockhash_cache = Arc::new(InvalidBlockhashCache::new());
+    let invalid_blockhash_cache = Arc::new(RwLock::new(InvalidBlockhashCache::new()));
     let solana_rpc = Arc::new(GrpcGeyserImpl::new(
         env.grpc_url
             .ok_or_else(|| anyhow!("GRPC_URL environment variable is required"))?,

@@ -4,7 +4,7 @@ services:
   atlas-txn-sender:
     build: .
     ports:
-      - '7998:7998' # Datadog statsd port
+      - '80:4040' # container to host 80
     environment:
       - RPC_URL=https://devnet.helius-rpc.com/?api-key=c8405459-a909-4d08-a58e-ba28165268ab
       - GRPC_URL=https://grpc-takehome-devnet.helius-rpc.com:443

@@ -11,6 +11,7 @@ use serde::Deserialize;
 use solana_rpc_client_api::config::RpcSendTransactionConfig;
 use solana_sdk::transaction::VersionedTransaction;
 use solana_transaction_status::UiTransactionEncoding;
+use tokio::sync::RwLock;
 
 use crate::{
     errors::invalid_request,
@@ -52,7 +53,7 @@ pub struct AtlasTxnSenderImpl {
     txn_sender: Arc<dyn TxnSender>,
     transaction_store: Arc<dyn TransactionStore>,
     max_txn_send_retries: usize,
-    invalid_blockhash_cache: Arc<InvalidBlockhashCache>,
+    invalid_blockhash_cache: Arc<RwLock<InvalidBlockhashCache>>,
 }
 
 impl AtlasTxnSenderImpl {
@@ -60,7 +61,7 @@ impl AtlasTxnSenderImpl {
         txn_sender: Arc<dyn TxnSender>,
         transaction_store: Arc<dyn TransactionStore>,
         max_txn_send_retries: usize,
-        invalid_blockhash_cache: Arc<InvalidBlockhashCache>,
+        invalid_blockhash_cache: Arc<RwLock<InvalidBlockhashCache>>,
     ) -> Self {
         Self {
             txn_sender,
@@ -70,7 +71,7 @@ impl AtlasTxnSenderImpl {
         }
     }
 
-    fn validate_and_decode_transaction(
+    async fn validate_and_decode_transaction(
         &self,
         txn: String,
         params: &RpcSendTransactionConfig,
@@ -105,6 +106,8 @@ impl AtlasTxnSenderImpl {
         let blockhash = versioned_transaction.message.recent_blockhash();
         if self
             .invalid_blockhash_cache
+            .read()
+            .await
             .is_invalid(&blockhash.to_string())
         {
             return Err(invalid_request("Blockhash is invalid"));
@@ -147,8 +150,9 @@ impl AtlasTxnSenderServer for AtlasTxnSenderImpl {
         let start = Instant::now();
         let sig;
 
-        if let (Some(transaction), signature) =
-            self.validate_and_decode_transaction(txn, &params, &request_metadata, start)?
+        if let (Some(transaction), signature) = self
+            .validate_and_decode_transaction(txn, &params, &request_metadata, start)
+            .await?
         {
             self.txn_sender.send_transaction(transaction);
             sig = signature;
@@ -178,23 +182,24 @@ impl AtlasTxnSenderServer for AtlasTxnSenderImpl {
     ) -> RpcResult<Vec<String>> {
         let start = Instant::now();
         let mut transaction_data_vec = Vec::new();
+        let mut signatures = Vec::new();
 
         // TODO: parallelize validations?
         for txn in transactions {
-            let (transaction, _) =
-                self.validate_and_decode_transaction(txn, &params, &request_metadata, start)?;
+            let (transaction, signature) = self
+                .validate_and_decode_transaction(txn, &params, &request_metadata, start)
+                .await?;
             if transaction.is_none() {
                 return Err(invalid_request(
                     "Bundle contains duplicate or invalid transactions.",
                 ));
             }
             transaction_data_vec.push(transaction.unwrap());
+            signatures.push(signature);
         }
 
-        let signatures = self
-            .txn_sender
-            .send_transaction_bundle(transaction_data_vec)
-            .await;
+        self.txn_sender
+            .send_transaction_bundle(transaction_data_vec);
         let api_key = request_metadata
             .as_ref()
             .map(|m| m.api_key.as_str())

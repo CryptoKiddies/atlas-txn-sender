@@ -38,7 +38,7 @@ COPY . .
 RUN ansible-playbook -i ansible/inventory/hosts.yml ansible/deploy_atlas_txn_sender.yml
 
 # Expose the port the app runs on
-EXPOSE 7998
+EXPOSE 4040
 
 # Start the application (using the path where ansible built it)
 CMD ["/home/ubuntu/atlas-txn-sender/target/release/atlas_txn_sender"] 
